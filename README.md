@@ -1,5 +1,5 @@
 # TOTK_BARS_Tool
-A tool to replace and add bwavs to bars from TOTK
+A tool to patch and add bwavs to bars from TOTK
 
 ## Usage
 - Run the bars_tool.py or download the built release.
