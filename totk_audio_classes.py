@@ -322,7 +322,15 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
         # condition in the line above - the last channel's samples don't need to be padded, but must remember about it if this BWAV is not the last one in BARS - caller must worry about it
         return pad_till(header_and_info_part) + samples_part if samples_part > 0 else header_and_info_part
             
+    def get_peak_volume(self) -> float:
+            """returns peak volume of all channels as linear (0 to 1, both inclusive)
 
+            used for populating AMTA"""
+            decoded = self.decode()
+            all_samples = [sample for channel_samples in decoded for sample in channel_samples]
+            max_sample = max(abs(sample) for sample in all_samples)
+            return max_sample / 32768
+    
     def convert_to_prefetch(self) -> bool:
         if self.header.is_prefetch:
             return True
@@ -563,7 +571,7 @@ class Bars:
             writer.close()
 
     def get_size(self) -> int:
-        header_crc_metas_part = pad_till(4 + 4 + 2 + 6 + (4 * self.asset_count) + (8 * self.asset_count) + len(self.unknown) + sum([meta.get_size() for meta in self.metas]))
+        header_crc_metas_part = self.get_header_size(self.asset_count)
 
         # get only unique assets, as some metas can point to the same asset
         unique_assets: List[Tuple[int, int]] = []
@@ -581,6 +589,9 @@ class Bars:
         full_size = header_crc_metas_part + assets_part
 
         return full_size
+    
+    def get_header_size(self, custom_count) -> int:
+        return pad_till(4 + 4 + 2 + 6 + (4 * custom_count) + (8 * custom_count) + len(self.unknown) + sum([meta.get_size() for meta in self.metas]))
     
     def replace_bwav(self, bwav_path: str, resize_if_needed: bool = False) -> bool:
         import pathlib
@@ -701,7 +712,7 @@ class Bars:
         # Create Data Section
         new_amta.DATA_size = 40
         new_amta.name_crc = calculate_crc32_hash(name)
-        new_amta.flags = 2
+        new_amta.flags = 0
         new_amta.tracks_per_channel = 1
         new_amta.channel_count = 1
         new_amta.rest_of_data = b'\x00\x04'
@@ -709,10 +720,10 @@ class Bars:
         # Create Unknown section
         new_amta.UNKNOWN_section = AmtaUnknownSection(None, None)
         new_amta.UNKNOWN_section.unk_1 = 79
-        new_amta.UNKNOWN_section.unk_2 = 0.190277099609375
-        new_amta.UNKNOWN_section.unk_3 = 0.00570450210943818
-        new_amta.UNKNOWN_section.unk_4 = -43.5840492248535
-        new_amta.UNKNOWN_section.unk_5 = -43.5840492248535
+        new_amta.UNKNOWN_section.unk_2 = bwav_new.get_peak_volume()
+        new_amta.UNKNOWN_section.unk_3 = 0.005
+        new_amta.UNKNOWN_section.unk_4 = -43.6
+        new_amta.UNKNOWN_section.unk_5 = -43.6
         new_amta.UNKNOWN_section.unk_6 = 0.0
         
         # Convert unknown section to bytes
@@ -723,31 +734,32 @@ class Bars:
         
         new_amta.size = new_amta.get_size()
         
-        # Make space for header, 8 bytes per asset
-        for idx, offset in enumerate(self.meta_offsets):
-            self.meta_offsets[idx] = offset + 12
-        
+        # Logic for fist meta and next metas is different
         if self.asset_count > 0:
+            # Make space for header, 4 bytes for each crc32, meta offset and bwav offset
+            for idx, offset in enumerate(self.meta_offsets):
+                self.meta_offsets[idx] = offset + 4 * 3
+            
             self.meta_offsets.append(self.meta_offsets[-1] + self.metas[-1].get_size())
         else:
-            self.meta_offsets.append(self.get_size())
+            # Make space for heazder, 4 bytes for each crc32, meta offset and bwav offset
+            self.meta_offsets.append(16 + 4 + (4 * 3))
         
         # Add to metas before adding assets
         self.metas.append(new_amta)
         
         # Correct Asset offsets for new amta
         if self.asset_count > 0:
-            offset_difference = (self.meta_offsets[-1] + self.metas[-1].get_size()) - self.asset_offsets[0]
-        else:
-            offset_difference = 0
+            offset_difference = self.get_header_size(self.asset_count + 1) - self.asset_offsets[0]  
+            
+            for idx, offset in enumerate(self.asset_offsets):
+                self.asset_offsets[idx] = offset + offset_difference
         
-        for idx, offset in enumerate(self.asset_offsets):
-            self.asset_offsets[idx] = offset + offset_difference
-        
+        # Logic for fist asset and next assets is different
         if self.asset_count > 0:
-            self.asset_offsets.append(self.asset_offsets[-1] + self.assets[-1].get_size())
+            self.asset_offsets.append(self.asset_offsets[-1] + pad_till(self.assets[-1].get_size()))
         else:
-            self.asset_offsets.append(self.get_size())
+            self.asset_offsets.append(self.get_header_size(1))
         
         self.assets.append(bwav_new)
         

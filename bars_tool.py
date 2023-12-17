@@ -67,12 +67,13 @@ def clear_bars(bars):
     
     bars.crc_hashes.clear()
     
-    bars.unknown = b''
+    bars.unknown = 4 * b'\x00'
     
     bars.size = bars.get_size()
 
 def add_or_replace_bars(bars, bwav_path):
-    for bwav in glob.glob(bwav_path + "/" + "*.bwav"):
+    bwav_paths = glob.glob(bwav_path + "/" + "*.bwav")
+    for bwav in bwav_paths:
         bars.add_or_replace_bwav(bwav, True)
 
 def save_bars(bars):
