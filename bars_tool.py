@@ -5,6 +5,11 @@ import glob
 import PySimpleGUI as sg
 from totk_audio_classes import Bars
 from tkinter import filedialog as fd
+import binascii
+import pathlib
+
+def calculate_crc32_hash(input_string):
+    return binascii.crc32(input_string.encode('utf8'))
 
 ### pyinstaller bars_tool.py --onefile
 
@@ -71,9 +76,19 @@ def clear_bars(bars):
     
     bars.size = bars.get_size()
 
-def add_or_replace_bars(bars, bwav_path):
-    bwav_paths = glob.glob(bwav_path + "/" + "*.bwav")
-    for bwav in bwav_paths:
+def add_or_replace_bars(bars, bwavs_path):
+    bwav_paths = glob.glob(bwavs_path + "/" + "*.bwav")
+    
+    bwav_name_hashes = {}
+    
+    for bwav_path in bwav_paths:
+        bwav_name = pathlib.Path(bwav_path).stem
+        bwav_name_hash = calculate_crc32_hash(bwav_name)
+        bwav_name_hashes[bwav_name_hash] = bwav_path
+        
+    sorted_bwav_name_hashes = dict(sorted(bwav_name_hashes.items()))
+    
+    for bwav in sorted_bwav_name_hashes.values():
         bars.add_or_replace_bwav(bwav, True)
 
 def save_bars(bars):

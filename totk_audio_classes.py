@@ -175,7 +175,7 @@ class Amta:
         writer.write(self.rest_of_file)
 
     def get_size(self) -> int:
-        return 4 + 2 + 6 + 24 + 14 + len(self.rest_of_data) + len(self.rest_of_file) # one element per write
+        return pad_till(4 + 2 + 6 + 24 + 14 + len(self.rest_of_data) + len(self.rest_of_file), 4) # one element per write
         # return self.size # content length doesn't change YET
 
 class BwavFileHeader: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
@@ -558,7 +558,7 @@ class Bars:
             writer.write(struct.pack(self.bom + '2I', self.meta_offsets[idx], self.asset_offsets[idx])) # 8 * self.asset_count
 
         writer.write(self.unknown)
-
+        
         for idx, meta_offset in enumerate(self.meta_offsets):
             writer.seek(meta_offset)
             self.metas[idx].write(writer)
@@ -712,7 +712,7 @@ class Bars:
         # Create Data Section
         new_amta.DATA_size = 40
         new_amta.name_crc = calculate_crc32_hash(name)
-        new_amta.flags = 0
+        new_amta.flags = 2
         new_amta.tracks_per_channel = 1
         new_amta.channel_count = 1
         new_amta.rest_of_data = b'\x00\x04'
@@ -730,7 +730,7 @@ class Bars:
         new_amta.rest_of_data = new_amta.rest_of_data + new_amta.UNKNOWN_section.to_bytes(self.bom)
         
         # End of amta
-        new_amta.rest_of_file = pad_to_4_byte_boundary(name.encode() + b'\x00')
+        new_amta.rest_of_file = name.encode() + b'\x00'
         
         new_amta.size = new_amta.get_size()
         
