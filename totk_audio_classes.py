@@ -1,11 +1,13 @@
 # Written by NanobotZ
 # Modified by MediaMoots
 
-from io import BufferedReader, BufferedWriter, IOBase, BytesIO
-import struct
 import copy
+import bisect
+import struct
+import pathlib
 import binascii
 from typing import List, Tuple, Union
+from io import BufferedReader, BufferedWriter, IOBase, BytesIO
 
 def calculate_crc32_hash(input_string):
     return binascii.crc32(input_string.encode('utf8'))
@@ -477,7 +479,7 @@ class Bars:
         self.bom: str
         self.version_minor: int
         self.version_major: int
-        self.asset_count: int
+        self.meta_count: int
         self.crc_hashes: List[int] = []
         self.meta_offsets: List[int] = []
         self.asset_offsets: List[int] = []
@@ -507,13 +509,13 @@ class Bars:
 
         version = reader.read(2)
 
-        asset_count = reader.read(4)
+        meta_count = reader.read(4)
 
-        self.size, self.version_minor, self.version_major, self.asset_count = struct.unpack(self.bom + 'I2BI', size + version + asset_count)
+        self.size, self.version_minor, self.version_major, self.meta_count = struct.unpack(self.bom + 'I2BI', size + version + meta_count)
 
-        self.crc_hashes.extend(struct.unpack(self.bom + 'I' * self.asset_count, reader.read(4 * self.asset_count)))
+        self.crc_hashes.extend(struct.unpack(self.bom + 'I' * self.meta_count, reader.read(4 * self.meta_count)))
 
-        for _ in range(self.asset_count):
+        for _ in range(self.meta_count):
             meta_offset, asset_offset = struct.unpack(self.bom + '2I', reader.read(8))
             self.meta_offsets.append(meta_offset)
             self.asset_offsets.append(asset_offset)
@@ -550,12 +552,12 @@ class Bars:
         writer.write(self.magic) # 4
         writer.write(struct.pack(self.bom + 'I', self.size)) # 4
         writer.write(b'\xFE\xFF' if self.bom == '>' else b'\xFF\xFE') # 2
-        writer.write(struct.pack(self.bom + '2BI', self.version_minor, self.version_major, self.asset_count)) # 6
+        writer.write(struct.pack(self.bom + '2BI', self.version_minor, self.version_major, self.meta_count)) # 6
 
-        writer.write(struct.pack(self.bom + 'I' * self.asset_count, *self.crc_hashes)) # 4 * self.asset_count
+        writer.write(struct.pack(self.bom + 'I' * self.meta_count, *self.crc_hashes)) # 4 * self.meta_count
 
-        for idx in range(self.asset_count):
-            writer.write(struct.pack(self.bom + '2I', self.meta_offsets[idx], self.asset_offsets[idx])) # 8 * self.asset_count
+        for idx in range(self.meta_count):
+            writer.write(struct.pack(self.bom + '2I', self.meta_offsets[idx], self.asset_offsets[idx])) # 8 * self.meta_count
 
         writer.write(self.unknown)
         
@@ -569,18 +571,18 @@ class Bars:
 
         if writer_opened_here:
             writer.close()
-
+    
     def get_size(self) -> int:
-        header_crc_metas_part = self.get_header_size(self.asset_count)
+        header_crc_metas_part = self.get_header_size(self.meta_count)
 
         # get only unique assets, as some metas can point to the same asset
         unique_assets: List[Tuple[int, int]] = []
-        for idx in range(self.asset_count):
+        for idx in range(self.meta_count):
             if not [idx_offset_tuple for idx_offset_tuple in unique_assets if idx_offset_tuple[1] == self.asset_offsets[idx]]:
                 unique_assets.append((idx, self.asset_offsets[idx]))
             
         assets_part = 0  
-        if self.asset_count > 0:
+        if self.meta_count > 0:
             last_idx = unique_assets[-1][0]
 
             # condition below - the last BWAV doesn't need to be padded
@@ -591,7 +593,30 @@ class Bars:
         return full_size
     
     def get_header_size(self, custom_count) -> int:
-        return pad_till(4 + 4 + 2 + 6 + (4 * custom_count) + (8 * custom_count) + len(self.unknown) + sum([meta.get_size() for meta in self.metas]))
+        return pad_till(4 + 4 + 2 + 6 + (4 * custom_count) + (8 * custom_count) + len(self.unknown) + (sum([meta.get_size() for meta in self.metas])))
+    
+    def get_preheader_size(self, custom_count) -> int:
+        return 4 + 4 + 2 + 6 + (4 * custom_count) + (8 * custom_count) + len(self.unknown)
+    
+    def calculate_offsets(self):
+        # Calculate meta offsets
+        bars_preheader_size = self.get_preheader_size(self.meta_count)
+        self.meta_offsets.clear()
+        for idx, meta in enumerate(self.metas):
+            if idx > 0:
+                self.meta_offsets.append(self.meta_offsets[-1] + meta.get_size())
+            else:
+                self.meta_offsets.append(bars_preheader_size)
+        
+        # Calculate asset offsets
+        bars_header_size = self.get_header_size(self.meta_count)
+        self.asset_offsets.clear()
+        for idx, asset in enumerate(self.assets):
+            if idx > 0:
+                self.asset_offsets.append(self.asset_offsets[-1] + pad_till(self.assets[idx - 1].get_size()))
+            else:
+                self.asset_offsets.append(bars_header_size)
+            
     
     def replace_bwav(self, bwav_path: str, resize_if_needed: bool = False) -> bool:
         import pathlib
@@ -654,7 +679,7 @@ class Bars:
 
             size = bwav_old.get_size()
             idx_from = idx if same_offset_indexes[0] < idx else same_offset_indexes[0]
-            for idx_resize in range(idx_from, self.asset_count):
+            for idx_resize in range(idx_from, self.meta_count):
                 self.asset_offsets[idx_resize] += size # is this correct?
         
         # move offsets if there is a size difference
@@ -666,7 +691,7 @@ class Bars:
             else:
                 print(f"{name} - New and old BWAVs are different in size")
 
-            for idx_resize in range(idx + 1, self.asset_count):
+            for idx_resize in range(idx + 1, self.meta_count):
                 self.asset_offsets[idx_resize] += size_diff
 
         # swap old asset with the new one
@@ -676,22 +701,7 @@ class Bars:
     
         return True
     
-    def add_or_replace_bwav(self, bwav_path: str, resize_if_needed: bool = False) -> bool:
-        import pathlib
-        name = pathlib.Path(bwav_path).stem
-
-        found = False
-        for idx, meta in enumerate(self.metas):
-            if meta.name == name:
-                found = True
-                break
-        
-        if found:
-            self.replace_bwav(bwav_path, resize_if_needed)
-            return False
-        
-        bwav_new = Bwav(bwav_path)
-        
+    def create_new_amta(self, name, bwav):
         # Create amta
         new_amta = Amta(None)
         
@@ -720,7 +730,7 @@ class Bars:
         # Create Unknown section
         new_amta.UNKNOWN_section = AmtaUnknownSection(None, None)
         new_amta.UNKNOWN_section.unk_1 = 79
-        new_amta.UNKNOWN_section.unk_2 = bwav_new.get_peak_volume()
+        new_amta.UNKNOWN_section.unk_2 = bwav.get_peak_volume()
         new_amta.UNKNOWN_section.unk_3 = 0.005
         new_amta.UNKNOWN_section.unk_4 = -43.6
         new_amta.UNKNOWN_section.unk_5 = -43.6
@@ -733,41 +743,37 @@ class Bars:
         new_amta.rest_of_file = name.encode() + b'\x00'
         
         new_amta.size = new_amta.get_size()
+        return new_amta
+    
+    def add_or_replace_bwav(self, bwav_path: str, resize_if_needed: bool = False) -> bool:
         
-        # Logic for fist meta and next metas is different
-        if self.asset_count > 0:
-            # Make space for header, 4 bytes for each crc32, meta offset and bwav offset
-            for idx, offset in enumerate(self.meta_offsets):
-                self.meta_offsets[idx] = offset + 4 * 3
-            
-            self.meta_offsets.append(self.meta_offsets[-1] + self.metas[-1].get_size())
-        else:
-            # Make space for heazder, 4 bytes for each crc32, meta offset and bwav offset
-            self.meta_offsets.append(16 + 4 + (4 * 3))
+        # Get and calculate name
+        name = pathlib.Path(bwav_path).stem
+        name_hash = calculate_crc32_hash(name)
         
-        # Add to metas before adding assets
-        self.metas.append(new_amta)
+        # Check if exists        
+        if name_hash in self.crc_hashes:
+            self.replace_bwav(bwav_path, resize_if_needed)
+            return False
         
-        # Correct Asset offsets for new amta
-        if self.asset_count > 0:
-            offset_difference = self.get_header_size(self.asset_count + 1) - self.asset_offsets[0]  
-            
-            for idx, offset in enumerate(self.asset_offsets):
-                self.asset_offsets[idx] = offset + offset_difference
+        # Create amta and bwav 
+        new_bwav = Bwav(bwav_path)
+        new_amta = self.create_new_amta(name, new_bwav)
         
-        # Logic for fist asset and next assets is different
-        if self.asset_count > 0:
-            self.asset_offsets.append(self.asset_offsets[-1] + pad_till(self.assets[-1].get_size()))
-        else:
-            self.asset_offsets.append(self.get_header_size(1))
+        # Calculate Insertion point
+        insertion_index = bisect.bisect_left(self.crc_hashes, name_hash)
         
-        self.assets.append(bwav_new)
-        
-        self.crc_hashes.append(calculate_crc32_hash(name))
+        # Add to lists
+        self.metas.insert(insertion_index, new_amta)
+        self.assets.insert(insertion_index, new_bwav)
+        self.crc_hashes.insert(insertion_index, name_hash)
 
-        self.asset_count += 1
+        # Set bars vars
+        self.meta_count += 1
+        self.calculate_offsets()
         self.size = self.get_size()
     
         return True
         
-# written by NanobotZ
+# Written by NanobotZ
+# Modified by MediaMoots
