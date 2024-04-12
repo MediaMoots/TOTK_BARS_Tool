@@ -232,13 +232,13 @@ class BwavChannelInfo: #https://gota7.github.io/Citric-Composer/specs/binaryWav.
         self.dsp_adpcm_coefficients = reader.read(32) # TODO read with BOM!!!
         self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
             is_looping, self.loop_end_sample, self.loop_start_sample, self.predictor_scale, \
-            self.history_sample_1, self.history_sample_2, self.padding = struct.unpack(bom + '5I4H', reader.read(28))
+            self.history_sample_1, self.history_sample_2, self.padding = struct.unpack(bom + '5IH2hH', reader.read(28))
         self.is_looping = is_looping == 1
 
     def write(self, writer: BufferedWriter, bom: str) -> None:
         writer.write(struct.pack(bom + '2H3I', self.codec, self.channel_pan, self.sample_rate, self.num_samples_nonprefetch, self.num_samples_this)) # 16
         writer.write(self.dsp_adpcm_coefficients) # TODO write with BOM!!!
-        writer.write(struct.pack(bom + '5I4H', self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
+        writer.write(struct.pack(bom + '5IH2hH', self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
             1 if self.is_looping else 0, self.loop_end_sample, self.loop_start_sample, self.predictor_scale, \
             self.history_sample_1, self.history_sample_2, self.padding)) # 28
         
