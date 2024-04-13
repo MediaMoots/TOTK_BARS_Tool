@@ -1,13 +1,12 @@
 # Written by NanobotZ
-# Modified by MediaMoots
+# Modified by MediaMoots and NanobotZ
 
-import copy
 import bisect
 import struct
 import pathlib
 import binascii
 from typing import List, Tuple, Union
-from io import BufferedReader, BufferedWriter, IOBase, BytesIO
+from io import BufferedReader, BufferedWriter, IOBase
 
 def calculate_crc32_hash(input_string):
     return binascii.crc32(input_string.encode('utf8'))
@@ -233,13 +232,13 @@ class BwavChannelInfo: #https://gota7.github.io/Citric-Composer/specs/binaryWav.
         self.dsp_adpcm_coefficients = reader.read(32) # TODO read with BOM!!!
         self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
             is_looping, self.loop_end_sample, self.loop_start_sample, self.predictor_scale, \
-            self.history_sample_1, self.history_sample_2, self.padding = struct.unpack(bom + '5I4H', reader.read(28))
+            self.history_sample_1, self.history_sample_2, self.padding = struct.unpack(bom + '5IH2hH', reader.read(28))
         self.is_looping = is_looping == 1
 
     def write(self, writer: BufferedWriter, bom: str) -> None:
         writer.write(struct.pack(bom + '2H3I', self.codec, self.channel_pan, self.sample_rate, self.num_samples_nonprefetch, self.num_samples_this)) # 16
         writer.write(self.dsp_adpcm_coefficients) # TODO write with BOM!!!
-        writer.write(struct.pack(bom + '5I4H', self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
+        writer.write(struct.pack(bom + '5IH2hH', self.absolute_start_samples_nonprefetch, self.absolute_start_samples_this, \
             1 if self.is_looping else 0, self.loop_end_sample, self.loop_start_sample, self.predictor_scale, \
             self.history_sample_1, self.history_sample_2, self.padding)) # 28
         
@@ -274,11 +273,17 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
         for _ in range(self.header.num_channels):
             self.channel_infos.append(BwavChannelInfo(reader, self.header.bom))
 
-        samples_per_channel_to_read = size - self.channel_infos[-1].absolute_start_samples_this
-        
         for channel in self.channel_infos:
             reader.seek(pos + channel.absolute_start_samples_this)
-            self.channel_samples.append(reader.read(samples_per_channel_to_read) if samples_per_channel_to_read > 0 else b'')
+
+            if channel.codec == 2:
+                reader.seek(36, 1)
+                samples_size = struct.unpack(self.header.bom + "I", reader.read(4))[0] + 40
+                reader.seek(-40, 1)
+            else:
+                samples_size = size - self.channel_infos[-1].absolute_start_samples_this
+            
+            self.channel_samples.append(reader.read(samples_size) if samples_size > 0 else b'')
 
         if reader_opened_here:
             reader.close()
@@ -322,7 +327,7 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
 
         samples_part = sum([pad_till(len(self.channel_samples[idx])) if idx != last_idx else len(self.channel_samples[idx]) for idx, _ in unique_samples])
         # condition in the line above - the last channel's samples don't need to be padded, but must remember about it if this BWAV is not the last one in BARS - caller must worry about it
-        return pad_till(header_and_info_part) + samples_part if samples_part > 0 else header_and_info_part
+        return (pad_till(header_and_info_part) + samples_part) if samples_part > 0 else header_and_info_part
             
     def get_peak_volume(self) -> float:
             """returns peak volume of all channels as linear (0 to 1, both inclusive)
@@ -345,11 +350,17 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
             req_samples = codec_samples[channel.codec]
             req_bytes = codec_bytes[channel.codec]
 
-            if channel.num_samples_this < req_samples and len(self.channel_samples[idx]) < req_bytes:
+            samples = self.channel_samples[idx]
+            if channel.codec == 2:
+                decoded_samples = self.decode_channel(idx, req_bytes // 2)
+                format = f"{self.header.bom}{len(decoded_samples)}h"
+                samples = struct.pack(format, *decoded_samples) # conversion to PCM bytes
+
+            if channel.num_samples_this < req_samples and len(samples) < req_bytes:
                 continue
             
             channel.num_samples_this = req_samples
-            self.channel_samples[idx] = self.channel_samples[idx][:req_bytes]
+            self.channel_samples[idx] = samples[:req_bytes]
             channel.absolute_start_samples_this = self.channel_infos[0].absolute_start_samples_this + (idx * req_bytes)
             converted = True
 
@@ -358,31 +369,45 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
 
         return converted
     
-    def decode_channel(self, channel_idx: int) -> List[int]:
+    def decode_channel(self, channel_idx: int, sample_limit: int = 0) -> List[int]:
         """returns a list of PCM16 (short) samples"""
         assert channel_idx < self.header.num_channels
 
         if self.decoded_channels[channel_idx]:
-            return self.decoded_channels[channel_idx]
+            samples = self.decoded_channels[channel_idx]
+            if sample_limit > 0:
+                return samples[:sample_limit]
+            return samples
+        
+        result_byte_limit = sample_limit * 2
+        reduced = False
 
         src = self.channel_samples[channel_idx]
         dst: List[int] = []
 
         channel_info = self.channel_infos[channel_idx]
         if channel_info.codec == 0:
-            for i in range(channel_info.num_samples_this):
-                dst.append(*struct.unpack(self.header.bom + "h", src[i*2:i*2+2]))
+            if result_byte_limit > 0 and len(src) > result_byte_limit:
+                reduced = True
+                src = src[:result_byte_limit]
+            format = f'{self.header.bom}{len(src) // 2}h'
+            dst.extend(struct.unpack(format, src))
+            # for i in range(channel_info.num_samples_this):
+            #     dst.append(*struct.unpack(self.header.bom + "h", src[i*2:i*2+2]))
         elif channel_info.codec == 1: # based on https://github.com/Thealexbarney/DspTool/blob/master/dsptool/decode.c
-            samples = channel_info.num_samples_this
+            num_samples = channel_info.num_samples_this
             hist1 = channel_info.history_sample_1
             hist2 = channel_info.history_sample_2
-            coefs = struct.unpack(self.header.bom + '16h', channel_info.dsp_adpcm_coefficients)
+            coefs: Tuple[int] = struct.unpack(self.header.bom + '16h', channel_info.dsp_adpcm_coefficients)
 
             SAMPLES_PER_FRAME = 14
-            frame_count = (samples + SAMPLES_PER_FRAME - 1) // SAMPLES_PER_FRAME
-            samples_remaining = samples
+            frame_count = (num_samples + SAMPLES_PER_FRAME - 1) // SAMPLES_PER_FRAME
+            samples_remaining = num_samples
+
+            dst = [0] * num_samples
 
             idx_src = 0
+            idx_dst = 0
             for _ in range(frame_count):
                 predictor = get_high_nibble(src[idx_src])
                 scale = 1 << get_low_nibble(src[idx_src])
@@ -391,13 +416,15 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
                 coef2 = coefs[predictor * 2 + 1]
 
                 samples_to_read = min(SAMPLES_PER_FRAME, samples_remaining)
-                for s in range(samples_to_read):
+                even = True
+                for _ in range(samples_to_read):
                     sample = 0
-                    if s % 2 == 0:
+                    if even:
                         sample = get_high_nibble(src[idx_src])
                     else:
                         sample = get_low_nibble(src[idx_src])
                         idx_src += 1
+                    even = not even
                     sample = sample - 16 if sample >= 8 else sample
                     sample = (((scale * sample) << 11) + 1024 + (coef1 * hist1 + coef2 * hist2)) >> 11
 
@@ -409,20 +436,52 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
 
                     hist2 = hist1
                     hist1 = final_sample
-                    dst.append(final_sample)
+                    dst[idx_dst] = final_sample
+                    idx_dst += 1
+                
+                if result_byte_limit > 0 and idx_dst > result_byte_limit:
+                    reduced = True
+                    dst = dst[:sample_limit]
+                    break
                 
                 samples_remaining -= samples_to_read
         elif channel_info.codec == 2:
-           raise NotImplementedError("Decoding Opus not implemented yet")
+            import pyogg
+            opus_dec = pyogg.OpusDecoder()
+            opus_dec.set_channels(1)
+            opus_dec.set_sampling_frequency(channel_info.sample_rate)
 
-        self.decoded_channels[channel_idx] = dst
+            data_len = len(src)
+            cur_idx = 40
+            total_pcm = bytes()
+            while cur_idx < data_len:
+                packet_size, = struct.unpack('>I', src[cur_idx:cur_idx+4])
+                cur_idx += 8 # skipping 4 unknown bytes
+                to_read = cur_idx + packet_size
+                packet = src[cur_idx:to_read]
+                decoded_pcm = opus_dec.decode(bytearray(packet))
+                total_pcm += decoded_pcm
+                
+                cur_idx += packet_size
+
+                if result_byte_limit > 0 and len(total_pcm) > result_byte_limit:
+                    reduced = True
+                    total_pcm = total_pcm[:result_byte_limit]
+                    break
+
+            format = f'{self.header.bom}{len(total_pcm) // 2}h'
+            dst.extend(struct.unpack(format, total_pcm))
+
+        if not reduced: # don't cache partially decoded samples
+            self.decoded_channels[channel_idx] = dst
+        
         return dst
     
-    def decode(self) -> List[List[int]]:
+    def decode(self, sample_limit_per_channel: int = 0) -> List[List[int]]:
         """returns a list of lists of PCM16 (short) samples, one list per channel"""
         result: List[List[int]] = []
         for channel_idx in range(self.header.num_channels):
-            result.append(self.decode_channel(channel_idx))
+            result.append(self.decode_channel(channel_idx, sample_limit_per_channel))
 
         return result
     
@@ -443,6 +502,92 @@ class Bwav: #https://gota7.github.io/Citric-Composer/specs/binaryWav.html
             output.setsampwidth(2)
             output.writeframes(data)
 
+    def convert_to_opus(self) -> None:
+        non_compatible = [x for x in self.channel_infos if x.codec == 2]
+        if non_compatible:
+            raise ValueError("Bwav is already opus")
+        
+        if self.header.is_prefetch:
+            raise ValueError("Can't convert a prefetch")
+        
+        non_compatible = [x for x in self.channel_infos if x.sample_rate != 48000]
+        if non_compatible:
+            raise ValueError("Invalid sample rate, must be 48000Hz")
+        
+        import pyogg
+
+        converted: List[bytes] = []
+        for channel_idx in range(self.header.num_channels):
+            samples = self.decode_channel(channel_idx)
+
+            pack_format = f"{self.header.bom}{len(samples)}h"
+            data = struct.pack(pack_format, *samples)
+            data_len = len(data)
+
+            opus_enc = pyogg.OpusEncoder()
+            opus_enc.set_application("audio")
+            opus_enc.set_sampling_frequency(self.channel_infos[channel_idx].sample_rate)
+            opus_enc.set_channels(1)
+            opus_enc.set_max_bytes_per_frame(240)
+
+            desired_frame_duration = 20/1000 # 20 milliseconds
+            desired_frame_size = int(desired_frame_duration * self.channel_infos[channel_idx].sample_rate)
+            bits_per_frame = 2
+            desired_data_portion_size = desired_frame_size * bits_per_frame
+
+            cur_idx = 0
+            result = bytes()
+            while cur_idx < data_len:
+                read_to = cur_idx + desired_data_portion_size
+                pcm = data[cur_idx:read_to]
+
+                if len(pcm) < desired_data_portion_size:
+                    null_byte_count = desired_data_portion_size - len(pcm)
+                    pcm += b"\x00" * null_byte_count
+
+                encoded = opus_enc.encode(pcm)
+                result += struct.pack('>I', len(encoded)) + (b'\x00' * 4) + encoded
+                cur_idx += desired_data_portion_size
+
+            skip = opus_enc.get_algorithmic_delay()
+
+            final_opus = b'\x01\x00\x00\x80\x18\x00\x00\x00\x00\x01\x00\x00\x80\xBB\x00\x00\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'
+            final_opus += struct.pack(self.header.bom + "I", skip)
+            final_opus += b'\x04\x00\x00\x80'
+            final_opus += struct.pack(self.header.bom + "I", len(result))
+            final_opus += result
+            
+            converted.append(final_opus)
+        
+        initial_offset = self.channel_infos[0].absolute_start_samples_this
+        for channel_idx, channel_info in enumerate(self.channel_infos):
+            channel_info.codec = 2
+            channel_info.dsp_adpcm_coefficients = b'\x00' * 32
+            channel_info.history_sample_1 = 0
+            channel_info.history_sample_2 = 0
+            channel_info.predictor_scale = 0
+
+            final_opus = converted[channel_idx]
+            final_size = len(final_opus)
+            self.channel_samples[channel_idx] = final_opus
+
+            channel_info.absolute_start_samples_this = initial_offset
+            channel_info.absolute_start_samples_nonprefetch = initial_offset
+
+            # not sure if these are required - all ToTK opus bwavs had these
+            channel_info.is_looping = True
+            channel_info.loop_start_sample = 0x00
+            channel_info.loop_end_sample = 0xFFFFFFFF
+
+            initial_offset += pad_till(final_size)
+        
+        self.recalculate_crc()
+    
+    def recalculate_crc(self) -> None:
+        crc = 0
+        for sample_data in self.channel_samples:
+            crc = binascii.crc32(sample_data, crc)
+        self.header.crc = crc
     
     def print_info(self) -> None:
         channel_pan_names = ["Left", "Right", "Middle", "Sub", "Side left", "Side right", "Rear ledt", "Rear right"]
@@ -649,11 +794,11 @@ class Bars:
             # In theory, it will result in smaller file sizes, but might cause confusion due to the other audio in Resources/Streams not being needed (?)
             # Need to check what happens when prefetch gets replaced with non-prefetch
             
-            # if not bwav_new.convert_to_prefetch():
-            #     print(f"{name} - Couldn't convert the new BWAV to prefetch...")
-            #     return False
-            # else:
-            print(f"{name} - Automatically converted BWAV to prefetch...")
+            if not bwav_new.convert_to_prefetch():
+                print(f"{name} - Couldn't convert the new BWAV to prefetch...")
+                return False
+            else:
+                print(f"{name} - Automatically converted BWAV to prefetch...")
 
         else:
             if bwav_new.header.is_prefetch:
@@ -776,4 +921,4 @@ class Bars:
         return True
         
 # Written by NanobotZ
-# Modified by MediaMoots
+# Modified by MediaMoots and NanobotZ
